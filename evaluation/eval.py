@@ -86,6 +86,7 @@ def get_model_answers(
 
     cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES')
     print('CUDA VISIBLE DEVICES:', cuda_visible_devices)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     question = questions[0]
 
@@ -103,10 +104,11 @@ def get_model_answers(
             conv.append_message(conv.roles[1], None)
             conv.stop_str = "</s>"
             prompt = conv.get_prompt()
-            inputs = tokenizer([prompt], return_tensors="pt").to("cuda")
+            inputs = tokenizer([prompt], return_tensors="pt").to(device)
             input_ids = inputs.input_ids
             try:
-                torch.cuda.synchronize()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
                 start_time = time.time()
                 output_ids, new_token, step, accept_length_tree = forward_func(
                     inputs,
@@ -115,7 +117,8 @@ def get_model_answers(
                     max_new_tokens,
                     **kwargs,
                 )
-                torch.cuda.synchronize()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
                 total_time = time.time() - start_time
                 output_ids = output_ids[0][len(input_ids[0]):]
                 # be consistent with the template's stop_token_ids
@@ -173,10 +176,11 @@ def get_model_answers(
                 conv.append_message(conv.roles[1], None)
                 conv.stop_str = "</s>"
                 prompt = conv.get_prompt()
-                inputs = tokenizer([prompt], return_tensors="pt").to("cuda")
+                inputs = tokenizer([prompt], return_tensors="pt").to(device)
                 input_ids = inputs.input_ids
                 try:
-                    torch.cuda.synchronize()
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
                     start_time = time.time()
                     output_ids, new_token, step, accept_length_tree = forward_func(
                         inputs,
@@ -185,7 +189,8 @@ def get_model_answers(
                         max_new_tokens,
                         **kwargs,
                     )
-                    torch.cuda.synchronize()
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
                     total_time = time.time() - start_time
                     accept_lengths_tree.extend(accept_length_tree)
                     output_ids = output_ids[0][len(input_ids[0]):]
@@ -256,4 +261,3 @@ def reorg_answer_file(answer_file):
     with open(answer_file, "w") as fout:
         for qid in qids:
             fout.write(answers[qid])
-

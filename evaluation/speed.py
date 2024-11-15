@@ -139,7 +139,7 @@ if __name__ == "__main__":
         "--tokenizer-path",
         default='/data/heming/pretrained_models/vicuna-7b-v1.3/',
         type=str,
-        help="The file path of evaluated baseline.",
+        help="The path to or name of the tokenizer",
     )
     parser.add_argument(
         "--mean-report",
