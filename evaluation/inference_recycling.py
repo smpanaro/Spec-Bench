@@ -17,7 +17,7 @@ from model.recycling.token_recycling import TokenRecycling
 
 def recycling_forward(inputs, model, tokenizer, max_new_tokens):
     input_ids = inputs.input_ids
-    outputs = model.token_recycling.generate(input_ids, max_new_tokens=max_new_tokens, silent=True)
+    outputs = model.token_recycling.generate(input_ids, max_new_tokens=max_new_tokens, hot_start=True, silent=True)
     output_ids = outputs.output_ids
     idx = outputs.total_steps
     new_token = len(output_ids[0][len(input_ids[0]):])
@@ -35,7 +35,7 @@ def recycling_forward(inputs, model, tokenizer, max_new_tokens):
     #         accept_length_list[-1] -= invalid_len
     #         new_token -= invalid_len
 
-    return output_ids, new_token, idx+1, accept_length_list
+    return output_ids, new_token, idx, accept_length_list
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

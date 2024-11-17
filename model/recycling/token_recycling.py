@@ -1,4 +1,3 @@
-from os import access
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.cache_utils import DynamicCache
@@ -83,9 +82,12 @@ class TokenRecycling:
         accepted_seqs = []
         steps = 0
 
-        if hot_start and self.should_speculate:
-            # TODO: Seed an initial guess.
-            pass
+        if self.should_speculate:
+            if not hot_start:
+                self.adjacency_matrix.fill_(0)
+            else:
+                # TODO: Seed an initial guess.
+                pass
 
         while input_ids.shape[-1] - prompt_length - guess_length < max_new_tokens:
             steps += 1
@@ -165,9 +167,9 @@ class TokenRecycling:
                             past_key_values, guess_caches = self.partition_cache(past_key_values, guess_length)
                         with signposter.use_interval("update verified cache", "end"):
                             self.update_verified_cache(past_key_values, guess_caches, longest_sequence)
-                        accepted_seqs[-1].extend(longest_sequence)
+                        accepted_seqs[-1].extend(longest_sequence.tolist())
                     elif past_key_values:
-                        past_key_values.crop(input_length)
+                        crop(past_key_values, input_length)
 
                 # Generate new guesses.
                 with signposter.use_interval("make guesses", "end"):
@@ -184,8 +186,20 @@ class TokenRecycling:
             print(f"Prompt: {prompt_length / (generation_start_time-prompt_start_time):.2f} tokens/sec")
             print(f"Generation: {(input_ids.shape[-1] - prompt_length - guess_length) / (end_time-generation_start_time):.2f} tokens/sec")
 
+        # Clean up outputs.
+        input_ids = input_ids[..., :input_ids.shape[-1]-guess_length]
+
+        # Strictly apply max token limit.
         if input_ids.shape[-1] > prompt_length + max_new_tokens:
-            input_ids = input_ids[..., :prompt_length + max_new_tokens]
+            trim_length = input_ids.shape[-1] - prompt_length - max_new_tokens
+            input_ids = input_ids[..., :-trim_length]
+            while trim_length > 0:
+                if len(accepted_seqs[-1]) <= trim_length:
+                    trim_length -= len(accepted_seqs.pop())
+                else:
+                    accepted_seqs[-1] = accepted_seqs[-1][:-trim_length]
+                    trim_length = 0
+            assert sum([len(s) for s in accepted_seqs]) == input_ids.shape[-1] - prompt_length
 
         return Outputs(output_ids=input_ids, accepted_sequences=accepted_seqs, total_steps=steps)
 
@@ -279,7 +293,7 @@ class TokenRecycling:
             guess_kvs.append((k[..., -guess_length:, :], v[..., -guess_length:, :]))
 
         cache_shape = cache.key_cache[0][0].shape
-        cache.crop(cache.get_seq_length() - guess_length)
+        crop(cache, cache.get_seq_length() - guess_length)
         return cache, guess_kvs
 
     @classmethod
@@ -496,3 +510,20 @@ def map_depthfirst(tree, fn: Callable[[Tree], T]) -> List[T]:
         res.append(fn(node))
         stack.extend(reversed(node.children))
     return res
+
+# TODO: Upgrade transformers to a version that supports this.
+def crop(cache: DynamicCache, max_length: int):
+    """Crop the past key values up to a new `max_length` in terms of tokens. `max_length` can also be
+    negative to remove `max_length` tokens. This is used in assisted decoding and contrastive search."""
+    # In case it is negative
+    if max_length < 0:
+        max_length = cache.get_seq_length() - abs(max_length)
+
+    if cache.get_seq_length() <= max_length:
+        return
+
+    cache.seen_tokens = max_length
+    for idx in range(len(cache.key_cache)):
+        if cache.key_cache[idx] != []:
+            cache.key_cache[idx] = cache.key_cache[idx][..., :max_length, :]
+            cache.value_cache[idx] = cache.value_cache[idx][..., :max_length, :]
