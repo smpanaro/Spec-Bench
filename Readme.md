@@ -15,6 +15,9 @@
 <font color="gray">Speedup comparison of Speculative Decoding methods on Spec-Bench, evaluated by Vicuna-7B-v1.3.</font>
 </div>
 
+> [!TIP]
+> Looking for the Token Recycling benchmarks on this branch? Scroll to the bottom of this README.
+
 ## Introduction
 
 Spec-Bench is a comprehensive benchmark designed for assessing Speculative Decoding methods across diverse scenarios. Based on Spec-Bench, we aim to establish and maintain a unified evaluation platform for open-source Speculative Decoding approaches. This platform facilitates the systematic assessment of existing methods ***in the same device and testing environment***, thereby ensuring fair comparisons. 
@@ -136,4 +139,21 @@ If you find the resources in this repository useful, please cite our paper:
     pages = "7655--7671",
 }
 ```
+
+## Unofficial Token Recycling Benchmarks
+
+- Device: a single NVIDIA A100 GPU (40GB) with 30 CPU cores
+- Testing environment: Pytorch 2.5.1, under CUDA 12.4
+- Experimental Settings: greedy decoding, FP16 precision, batch size = 1
+- Single run (not average of 3 runs like the official leaderboard)
+- Cold Start means the Token Recycling adjacency matrix was reset for each prompt.
+
+### Vicuna-7B-v1.3
+
+| Models                                                             | Multi-turn Conversation | Translation | Summa-rization | Question Answering | Mathematical Reasoning | Retrieval-aug. Generation | #Mean Accepted Tokens |  Overall  |
+| ------------------------------------------------------------------ | :---------------------: | :---------: | :------------: | :----------------: | :--------------------: | :-----------------------: | :-------------------: | :-------: |
+| [Recycling](https://github.com/smpanaro/token-recycling)           | 2.24x                   | 1.87x       | 2.08x          | 1.99x              | 2.50x                  | 1.80x                     | 2.67                  | 2.08x     |
+| [Recycling](https://github.com/smpanaro/token-recycling) Cold Start| 2.07x                   | 1.30x       | 2.23x          | 1.70x              | 2.30x                  | 1.95x                     | 2.55                  | 1.93x     |
+| [PLD](https://github.com/apoorvumang/prompt-lookup-decoding)       | 1.56x                   | 1.00x       | 2.54x          | 1.13x              | 1.55x                  | 1.80x                     | 1.75                  | 1.60x     |
+| [Lookahead](https://lmsys.org/blog/2023-11-21-lookahead-decoding/) | 1.45x                   | 1.13x       | 1.31x          | 1.20x              | 1.50x                  | 1.16x                     | 1.64                  | 1.30x     |
 

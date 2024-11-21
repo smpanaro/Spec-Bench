@@ -17,21 +17,14 @@ from model.recycling.token_recycling import TokenRecycling
 
 def recycling_forward(inputs, model, tokenizer, max_new_tokens):
     input_ids = inputs.input_ids
-    outputs = model.token_recycling.generate(input_ids, max_new_tokens=max_new_tokens, hot_start=True, silent=True)
+    outputs = model.token_recycling.generate(input_ids, max_new_tokens=max_new_tokens, hot_start=True, silent=True, stop_on_eos=True)
     output_ids = outputs.output_ids
     idx = outputs.total_steps
     new_token = len(output_ids[0][len(input_ids[0]):])
     accept_length_list = [len(s) for s in outputs.accepted_sequences]
 
     input_len = len(input_ids[0])
-    if tokenizer.eos_token_id in output_ids[0, input_len:].tolist():
-        for i, id in enumerate(output_ids[0, input_len:]):
-            if id == tokenizer.eos_token_id:
-                eos_token_ids_index = i
-        invalid_len = len(output_ids[0, input_len:]) - eos_token_ids_index - 1
-        if invalid_len > 0:
-            accept_length_list[-1] -= invalid_len
-            new_token -= invalid_len
+    assert not tokenizer.eos_token_id in output_ids[0, input_len:].tolist()
 
     return output_ids, new_token, idx, accept_length_list
 

@@ -1,8 +1,9 @@
+from numpy import dtype
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizer
 from transformers.cache_utils import DynamicCache
 import sys
-from typing import Callable, TypeVar, List, Tuple, Optional, Union
+from typing import Callable, TypeVar, List, Tuple, Optional, Union, cast
 import time
 
 from dataclasses import dataclass
@@ -29,7 +30,7 @@ class Config:
 
 @dataclass
 class Outputs:
-    output_ids: torch.LongTensor
+    output_ids: torch.Tensor
     accepted_sequences: List[List[int]]
     total_steps: int
 
@@ -43,8 +44,9 @@ class TokenRecycling:
         tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
         return cls(model, tokenizer)
 
-    def __init__(self, model, tokenizer):
+    def __init__(self, model, tokenizer: PreTrainedTokenizer):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.dtype = model.dtype
         self.model = model.to(self.device)
         self.tokenizer = tokenizer
 
@@ -62,16 +64,24 @@ class TokenRecycling:
         # The next level is the predicted token -- we would get it even without speculating.
         # The 3rd level is where we start to get bonus speculated tokens.
         self.tree_template = self.static_tree()
-        self.sequences = [torch.tensor(s, dtype=torch.long, device=self.device) for s in self.get_sequences(self.tree_template)]
         # Remove the root node from each.
         self.relative_position_ids = torch.tensor(self.get_relative_position_ids(self.tree_template), dtype=torch.long, device=self.device)[1:]
-        self.tree_attention_mask = self.get_tree_attention_mask(self.tree_template).bool()[1:, 1:].unsqueeze(0).unsqueeze(0).to(self.device) # transformers wants a 4D mask.
+        self.tree_attention_mask = self.get_tree_attention_mask(self.tree_template, device=self.device).bool()[1:, 1:]
 
-    def generate(self, prompt: Union[str, torch.LongTensor], max_new_tokens=150, hot_start=False, silent=False):
+
+    @torch.no_grad()
+    def generate(self,
+        prompt: Union[str, torch.Tensor],
+        max_new_tokens=150,
+        hot_start=False,
+        silent=False,
+        stop_on_eos=False,
+    ):
         """
         Generate text using token recycling method.
         """
-        input_ids = self.tokenizer(prompt, return_tensors="pt").to(self.device).input_ids if isinstance(prompt, str) else prompt.to(device=self.device)
+        input_ids = prompt.to(device=self.device) if isinstance(prompt, torch.Tensor) else \
+             cast(torch.Tensor, self.tokenizer(prompt, return_tensors="pt").to(self.device).input_ids)
         prompt_length = input_ids.shape[-1]
         guess_length = 0 # Number of trailing tokens in input_ids that are guesses.
         total_accepted_tokens = 0
@@ -79,6 +89,7 @@ class TokenRecycling:
         past_key_values: Optional[DynamicCache] = DynamicCache() if self.use_cache else None
         prompt_start_time = time.time()
         generation_start_time = None
+        cached_tree_layers = None
         accepted_seqs = []
         steps = 0
 
@@ -115,12 +126,12 @@ class TokenRecycling:
             next_token_index = -1 - guess_length
             if not hot_start:
                 # Initialize from the entire prompt if cold-starting.
-                self.adjacency_matrix[input_ids if use_full_input_ids else input_ids[..., -(guess_length+1):]] = logits.topk(Config.matrix_top_k).indices
+                self.adjacency_matrix[input_ids if use_full_input_ids else input_ids[..., -(guess_length+1):]] = logits.topk(Config.matrix_top_k).indices.to(self.adjacency_matrix.device)
                 hot_start = True
             else:
                 # Update the newest token and any guess tokens. Including guess tokens increases MAT.
                 update_slice = next_token_index if guess_length == 0 else slice(next_token_index, None)
-                self.adjacency_matrix[input_ids[:, update_slice]] = logits[:, update_slice, :].topk(Config.matrix_top_k).indices
+                self.adjacency_matrix[input_ids[:, update_slice]] = logits[:, update_slice, :].topk(Config.matrix_top_k).indices.to(self.adjacency_matrix.device)
             sp = sp("end")
 
             next_token = logits[:, next_token_index, :].argmax(dim=-1)
@@ -133,7 +144,7 @@ class TokenRecycling:
                 # Split inputs from guesses.
                 input_length = input_ids.shape[-1] - guess_length # Avoid negative slicing when guess_length is 0.
                 assert input_ids.shape[-1]  + next_token_index == input_length-1, f"Next token index {next_token_index} does not align with input length {input_length}"
-                guesses = input_ids[..., input_length:]
+                guesses = input_ids[..., input_length-1:] # NOTE: This includes a non-guess token, the root of the tree.
                 input_ids = torch.cat([input_ids[... , :input_length], next_token.unsqueeze(0)], dim=-1)
                 accepted_seqs.append([next_token.item()])
 
@@ -143,13 +154,12 @@ class TokenRecycling:
                     guess_logits = logits[..., input_length-1:, :] if use_full_input_ids else logits
                     guess_max = guess_logits.argmax(dim=-1)
                     assert guess_max[0, 0] == next_token, f"Expected {next_token} as first part of guess but got {guess_max[0, 0]}"
-                    with signposter.use_interval("matching sequences", "end"):
-                        matches = self.matching_sequences(guesses, guess_max[...,:-1], self.sequences)
+                    with signposter.use_interval("longest sequence", "end"):
+                        longest_sequence = self.get_longest_sequence(self.tree_template, guesses, guess_max)
 
-                    if len(matches) > 0:
-                        longest_sequence = max(matches, key=lambda s: s.shape[-1])
-                        assert guesses[0, longest_sequence[0]] == next_token, f"Expected {next_token.item()} as first part of sequence but got {guesses[0, longest_sequence[0]]}"
-                        verified_ids = guess_max[..., longest_sequence+1]
+                    if len(longest_sequence) > 0:
+                        assert guesses[0, longest_sequence[1]] == next_token, f"Expected {next_token.item()} as first part of sequence but got {guesses[0, longest_sequence[0]]}"
+                        verified_ids = guess_max[..., longest_sequence[..., 1:]]
 
                         if not silent:
                             colors = ["95", "94", "92", "93", "91"]
@@ -163,43 +173,51 @@ class TokenRecycling:
                             sys.stdout.flush()
 
                         input_ids = torch.cat([input_ids, verified_ids], dim=-1)
-                        with signposter.use_interval("partition cache", "end"):
-                            past_key_values, guess_caches = self.partition_cache(past_key_values, guess_length)
-                        with signposter.use_interval("update verified cache", "end"):
-                            self.update_verified_cache(past_key_values, guess_caches, longest_sequence)
-                        accepted_seqs[-1].extend(longest_sequence.tolist())
+                        with signposter.use_interval("cache update", "end"):
+                            self.update_cache(past_key_values, guess_length, longest_sequence)
+                        accepted_seqs[-1].extend(longest_sequence[1:].tolist())
                     elif past_key_values:
                         crop(past_key_values, input_length)
 
                 # Generate new guesses.
                 with signposter.use_interval("make guesses", "end"):
-                    new_guesses = torch.tensor(self.merge_sequence(self.adjacency_matrix, self.tree_template, input_ids[..., -1]), device=self.device)[1:] # Exclude the latest known token.
+                    new_guesses, cached_tree_layers = self.merge_sequence(self.adjacency_matrix, self.tree_template, input_ids[..., -1], cached_tree_layers)
+                    new_guesses = new_guesses[1:] # Exclude the latest known token.
                 input_ids = torch.cat([input_ids, new_guesses.unsqueeze(0)], dim=-1)
                 guess_length = new_guesses.shape[-1]
             else:
                 input_ids = torch.cat([input_ids, next_token.unsqueeze(0)], dim=-1)
 
-        if total_guesses > 0 and not silent:
-            print(f"\n\nMean Accepted Tokens: {(torch.tensor([len(s) for s in accepted_seqs], dtype=torch.float).mean()):.2f}")
-        if generation_start_time is not None and not silent:
-            end_time = time.time()
-            print(f"Prompt: {prompt_length / (generation_start_time-prompt_start_time):.2f} tokens/sec")
-            print(f"Generation: {(input_ids.shape[-1] - prompt_length - guess_length) / (end_time-generation_start_time):.2f} tokens/sec")
+            if stop_on_eos and torch.isin(
+                input_ids[..., prompt_length:input_ids.shape[-1]-guess_length], self.tokenizer.eos_token_id or -1).any():
+                    break
+
+        if not silent:
+            print("\n")
+            if total_guesses > 0:
+                print(f"Mean Accepted Tokens: {(torch.tensor([len(s) for s in accepted_seqs], dtype=torch.float).mean()):.2f}")
+            if generation_start_time is not None:
+                end_time = time.time()
+                print(f"Prompt: {prompt_length / (generation_start_time-prompt_start_time):.2f} tokens/sec")
+                print(f"Generation: {(input_ids.shape[-1] - prompt_length - guess_length) / (end_time-generation_start_time):.2f} tokens/sec")
 
         # Clean up outputs.
         input_ids = input_ids[..., :input_ids.shape[-1]-guess_length]
 
-        # Strictly apply max token limit.
-        if input_ids.shape[-1] > prompt_length + max_new_tokens:
-            trim_length = input_ids.shape[-1] - prompt_length - max_new_tokens
+        # Strictly apply max token limit and EOS token preference.
+        eos_index = torch.where(input_ids[..., prompt_length:] == self.tokenizer.eos_token_id)[-1] + prompt_length
+        eos_index = eos_index.min().item() if stop_on_eos and eos_index.any() else input_ids.shape[-1]
+        trim_length = max(input_ids.shape[-1] - prompt_length - max_new_tokens, input_ids.shape[-1] - eos_index)
+        if trim_length > 0:
             input_ids = input_ids[..., :-trim_length]
-            while trim_length > 0:
+            while len(accepted_seqs) > 0 and trim_length > 0:
                 if len(accepted_seqs[-1]) <= trim_length:
                     trim_length -= len(accepted_seqs.pop())
                 else:
                     accepted_seqs[-1] = accepted_seqs[-1][:-trim_length]
                     trim_length = 0
             assert sum([len(s) for s in accepted_seqs]) == input_ids.shape[-1] - prompt_length
+            assert input_ids.shape[-1] <= prompt_length + max_new_tokens
 
         return Outputs(output_ids=input_ids, accepted_sequences=accepted_seqs, total_steps=steps)
 
@@ -218,6 +236,7 @@ class TokenRecycling:
             return None
 
         # Without KV Cache
+        # ▉: Attend
         # ┌────────────────────────────┐
         # │▉                           │
         # │▉▉▉                         │
@@ -251,66 +270,87 @@ class TokenRecycling:
         non_zero_rows = (self.adjacency_matrix.sum(dim=1) != 0).nonzero().squeeze()
 
         # Print samples
-        for idx in non_zero_rows[:num_samples]:
-            token = idx.item()
-            token_str = self.tokenizer.decode([token])
+        for token in non_zero_rows[:num_samples]:
+            token_str = self.tokenizer.decode([token.item()])
             candidates = self.adjacency_matrix[token]
             candidate_strs = [self.tokenizer.decode([c.item()]) for c in candidates]
             print(f"{token:8d} | {token_str:10s} | {candidate_strs}")
 
     @classmethod
-    def matching_sequences(cls, guess_ids: torch.Tensor, actual_ids: torch.Tensor, sequences: List[torch.Tensor]) -> List[torch.Tensor]:
+    def get_longest_sequence(cls, tree, guess_ids: torch.Tensor, actual_ids: torch.Tensor) -> torch.Tensor:
         """
         Compare the guessed speculated IDs to the actual IDs from the model output
         to see if any of the sequences were fully verified.
 
-        guess_ids: the input merged sequence [batch, guess_length]
-        actual_ids: the predicted merged sequence [batch, guess_length]
-        sequences: list of sequence index tensors of varying lengths
+        tree: the top-k tree structure
+        guess_ids: the input merged sequence [batch, guess_length+1], the tree root (not guessed) is in index 0
+        actual_ids: the predicted merged sequence [batch, guess_length+1], actual[i] corresponds to the prediction to follow guess[i]
         """
-        matches = []
-        # TODO: Probably faster as a depth-first search.
-        for sequence in sequences:
-            # The verification indices are based on the prior sequence index. See Figure 2 in the paper.
-            # Start at 0 to match the predicted next token.
-            verify_indices = [sequence[...,i-1]+1 if i > 0 else 0 for i in range(sequence.shape[-1])]
-            if (guess_ids[..., sequence] == actual_ids[..., verify_indices]).all().item():
-                matches.append(sequence)
-        return matches
+        device = guess_ids.device
+        guess_ids = guess_ids.cpu()
+        actual_ids = actual_ids.cpu()
+
+        def update(node, node_to_index, node_to_parent):
+            node_to_index[node] = len(node_to_index)
+            node_to_parent.update({child: node for child in node.children})
+
+        node_to_index = {}
+        node_to_parent = {}
+        map_breadthfirst(tree, lambda node: update(node, node_to_index, node_to_parent))
+
+        node_to_depth = {}
+        stack = list(reversed(tree.children)) # Skip the root node.
+        deepest = (None, -1)
+        while stack:
+            node = stack.pop()
+
+            node_depth = node_to_depth.get(node, 0)
+            node_to_depth.update({child: node_depth + 1 for child in node.children})
+
+            guess_index = node_to_index.get(node, None)
+            verify_index = node_to_index.get(node_to_parent.get(node), None)
+
+            if not torch.equal(guess_ids[...,guess_index], actual_ids[...,verify_index]):
+                # If current node is wrong, all children are too.
+                continue
+
+            if node_depth > deepest[1]:
+                deepest = (node, node_depth)
+
+            stack.extend(reversed(node.children))
+
+        longest = []
+        if deepest[0] is not None:
+            curr = deepest[0]
+            while curr is not None:
+                idx = node_to_index.get(curr)
+                curr = node_to_parent.get(curr, None)
+                longest.append(idx)
+
+        return torch.tensor(list(reversed(longest)), dtype=torch.long, device=device)
 
     @classmethod
-    def partition_cache(
-            cls, cache: Optional[DynamicCache], guess_length: int
-        ) -> Tuple[Optional[DynamicCache], List[Tuple[torch.Tensor, torch.Tensor]]]:
+    def update_cache(cls, cache: Optional[DynamicCache], guess_length: int, verified_indices: torch.Tensor):
         """
-        Crop the provided cache and return the guess portions of the cache as a list of (key, value) tuples for each layer.
-        """
-        if cache is None:
-            return None, []
+        Keep the entire non-guess part of the cache and add any verified parts.
 
-        guess_kvs = []
-        for k,v in zip(cache.key_cache, cache.value_cache):
-            guess_kvs.append((k[..., -guess_length:, :], v[..., -guess_length:, :]))
-
-        cache_shape = cache.key_cache[0][0].shape
-        crop(cache, cache.get_seq_length() - guess_length)
-        return cache, guess_kvs
-
-    @classmethod
-    def update_verified_cache(
-            cls, cache: Optional[DynamicCache], guess_caches: List[Tuple[torch.Tensor, torch.Tensor]], verified_indices: torch.Tensor
-        ):
-        """
-        Insert the portions from guess_caches that correspond to the verified indices into the cache.
-        guess_caches: list with one entry per model layer of (key_cache tensor, value_cache tensor)
+        guess_length: 3
+        verified_indices: [1]
+        initial cache: [0 1 2 3 4 5 6 7 | 8 9 10]
+        updated cache: [0 1 2 3 4 5 6 7 9]
         """
         if not cache:
             return
 
-        # Would some sort of index_select be faster? Avoid partition_cache.
-
-        for layer_idx, (k, v) in enumerate(guess_caches):
-            cache.update(k[..., verified_indices, :], v[..., verified_indices, :], layer_idx)
+        length = cache.key_cache[0].shape[-2]
+        input_length = cache.get_seq_length() - guess_length
+        keep_indices = torch.cat([
+            torch.arange(0, input_length, device=verified_indices.device),
+            verified_indices[1:] - 1 + input_length
+        ])
+        for layer_idx, (k,v) in enumerate(zip(cache.key_cache, cache.value_cache)):
+            cache.key_cache[layer_idx] = k.index_select(-2, keep_indices)
+            cache.value_cache[layer_idx] = v.index_select(-2, keep_indices)
 
     @classmethod
     def get_relative_position_ids(cls, tree):
@@ -337,7 +377,7 @@ class TokenRecycling:
         return map_breadthfirst(tree, lambda node: get_depth(node, depths))
 
     @classmethod
-    def get_tree_attention_mask(cls, tree) -> torch.Tensor:
+    def get_tree_attention_mask(cls, tree, device=None) -> torch.Tensor:
         """
         Generate a 2D attention mask based on the given tree where
         each child only attends to itself and its ancestors.
@@ -364,7 +404,7 @@ class TokenRecycling:
             node_to_index[node] = i
             node_to_parent.update({child: node for child in node.children})
 
-        mask = torch.zeros((n, n), dtype=torch.long)
+        mask = torch.zeros((n, n), dtype=torch.long, device=device)
         for i, node in enumerate(nodes):
             mask[i, i] = 1
 
@@ -378,48 +418,21 @@ class TokenRecycling:
         return mask
 
     @classmethod
-    def get_sequences(cls, tree):
-        """
-        Return a list of lists, each is a token recycling sequence
-        of breadthfirst-indices which omits the root node.
-        For example, the tree:
-           A
-         ╱   ╲
-        B     C
-        │
-        D
-        Returns [[1,3],[2]] (for: [[B,D], [C]])
-        """
-        node_to_index = {}
-        map_breadthfirst(tree, lambda node: node_to_index.update({node: len(node_to_index)}))
-
-        seqs = []
-        stack = [(tree, [node_to_index[tree]])]
-
-        while stack:
-            node, current_seq = stack.pop()
-
-            if len(current_seq) > 1:
-                seqs.append([x-1 for x in current_seq[1:]])
-            for child in reversed(node.children):
-                new_seq = current_seq + [node_to_index[child]]
-                stack.append((child, new_seq))
-
-        return seqs
-
-    @classmethod
-    def merge_sequence(cls, M: torch.Tensor, tree, xt):
+    def merge_sequence(cls, M: torch.Tensor, tree, xt, cached_layer_indices: Optional[list[list[torch.Tensor]]]):
         """
         Make a merged sequence based on adjacency matrix M, static tree structure, and last prompt token xt.
         This is the flattened tree of guessed sequences that will be passed to the model.
         Algorithm 1: Static Tree Based BFS in the paper.
         """
+        device = xt.device
+        xt = xt.to(M.device)
+
         S = []  # 1: Initialize S ← ∅
         root = xt  # 2: Initialize root ← xt
-        L = torch.tensor([root], dtype=torch.int, device=M.device) # 3: Initialize the current layer L ← (root)
+        L = root.to(dtype=torch.int, device=M.device) # 3: Initialize the current layer L ← (root)
         d = 0  # 4: Initialize the current depth d ← 0
 
-        def get_all_tree_layers(tree):
+        def get_all_tree_layers(tree) -> list[list[torch.Tensor]]:
             """
             Return a 3D list. [depth][node index][len(children)]
             """
@@ -428,14 +441,16 @@ class TokenRecycling:
                 node_to_depth.update((child, depth) for child in node.children)
                 if len(layers) <= depth:
                     layers.append([])
-                layers[depth].append([child.data for child in node.children])
+                layers[depth].append(torch.tensor([child.data for child in node.children], dtype=torch.long, device=M.device))
 
             layers = [[tree.data]]
             node_to_depth = {tree: 0}
             map_breadthfirst(tree, lambda node: update_layers(node, layers, node_to_depth))
             return layers[:-1] # Drop the final empty layer.
 
-        layer_indices = get_all_tree_layers(tree)[1:] # Skip first. Pre-compute this if it's slow.
+
+        layer_indices = get_all_tree_layers(tree)[1:] \
+            if cached_layer_indices is None else cached_layer_indices
         tree_depth = len(layer_indices)
         while d < tree_depth:  # 5: while d < Tree.depth do
             Lnext = []  # 6: Initialize next layer Lnext ← ∅
@@ -446,7 +461,7 @@ class TokenRecycling:
 
             # 9: Extract next layer tokens from xs with Tree
             # 10: Lnext = xs[Tree[d].index]
-            Lnext = torch.cat([x[indices] for x, indices in zip(xs, layer_indices[d])])
+            Lnext = torch.cat([x.index_select(0, indices) for x, indices in zip(xs, layer_indices[d])])
 
             # 11: Concatenate S and L
             # 12: S ← (S;L)
@@ -457,7 +472,7 @@ class TokenRecycling:
             d += 1
 
         S = torch.cat(S + [L])
-        return S.tolist()  # 15: return S
+        return S.to(device), layer_indices  # 15: return S
 
     @staticmethod
     def static_tree():
