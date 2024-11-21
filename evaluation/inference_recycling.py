@@ -23,17 +23,15 @@ def recycling_forward(inputs, model, tokenizer, max_new_tokens):
     new_token = len(output_ids[0][len(input_ids[0]):])
     accept_length_list = [len(s) for s in outputs.accepted_sequences]
 
-    # Needed?
-    assert not tokenizer.eos_token_id in output_ids[0, len(input_ids[0]):].tolist()
-    # input_len = len(input_ids[0])
-    # if tokenizer.eos_token_id in output_ids[0, input_len:].tolist():
-    #     for i, id in enumerate(output_ids[0, input_len:]):
-    #         if id == tokenizer.eos_token_id:
-    #             eos_token_ids_index = i
-    #     invalid_len = len(output_ids[0, input_len:]) - eos_token_ids_index - 1
-    #     if invalid_len > 0:
-    #         accept_length_list[-1] -= invalid_len
-    #         new_token -= invalid_len
+    input_len = len(input_ids[0])
+    if tokenizer.eos_token_id in output_ids[0, input_len:].tolist():
+        for i, id in enumerate(output_ids[0, input_len:]):
+            if id == tokenizer.eos_token_id:
+                eos_token_ids_index = i
+        invalid_len = len(output_ids[0, input_len:]) - eos_token_ids_index - 1
+        if invalid_len > 0:
+            accept_length_list[-1] -= invalid_len
+            new_token -= invalid_len
 
     return output_ids, new_token, idx, accept_length_list
 

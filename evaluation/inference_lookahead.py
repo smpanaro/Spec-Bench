@@ -19,7 +19,7 @@ from model.lade.decoding import CONFIG_MAP
 def lookahead_forward(inputs, model, tokenizer, max_new_tokens):
     input_ids = inputs.input_ids
     output_ids, idx, accept_length_list = model.generate(
-        torch.as_tensor(input_ids).cuda(),
+        torch.as_tensor(input_ids).to("cuda" if torch.cuda.is_available() else "cpu"),
         do_sample=False,
         temperature=0.0,
         max_new_tokens=max_new_tokens,
